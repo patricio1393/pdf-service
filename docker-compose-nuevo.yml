@@ -1,0 +1,42 @@
+services:
+  postgres:
+    container_name: postgres
+    image: postgres:16.9
+    restart: always
+    volumes:
+      - type: bind
+        source: /var/lib/postgresql/data
+        target: /var/lib/postgresql/data
+      - /root/app/init-data.sh:/docker-entrypoint-initdb.d/init-data.sh
+    env_file:
+      - .env
+    network_mode: host
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  n8n:
+    container_name: n8n
+    image: n8nio/n8n:2.28.3
+    restart: always
+    ports:
+      - 5678:5678
+    volumes:
+      - type: bind
+        source: /app/n8n_data
+        target: /home/node/.n8n
+      - type: bind
+        source: /app/local_files
+        target: /files
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    network_mode: host
+  pdf-service:
+    container_name: pdf-service
+    build: /root/app/pdf-service
+    restart: always
+    network_mode: host
