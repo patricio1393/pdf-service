@@ -12,6 +12,12 @@ const express = require('express');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const { PDFDocument } = require('pdf-lib');
+const { createCanvas, loadImage } = require('@napi-rs/canvas');
+const { readBarcodes, setZXingModuleOverrides } = require('zxing-wasm/reader');
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
@@ -92,8 +98,119 @@ const SIG = {
   ],
 };
 
+// =========================================================
+//  LECTURA DE DNI DESDE FOTOS (barcode PDF417 + OCR con voto)
+// =========================================================
+let _wasmReady = false;
+function initWasm() {
+  if (_wasmReady) return;
+  const wasmPath = require.resolve('zxing-wasm/dist/reader/zxing_reader.wasm');
+  setZXingModuleOverrides({ wasmBinary: fs.readFileSync(wasmPath) });
+  _wasmReady = true;
+}
+
+async function leerBarcode(buffer) {
+  initWasm();
+  const blob = new Blob([buffer], { type: 'image/jpeg' });
+  const results = await readBarcodes(blob, { tryHarder: true, formats: ['PDF417'], maxNumberOfSymbols: 3 });
+  for (const r of results) {
+    const campos = (r.text || '').split('@');
+    for (const c of campos) {
+      const limpio = c.trim().replace(/\D/g, '');
+      if (/^\d{7,8}$/.test(limpio)) return limpio;
+    }
+    const m = (r.text || '').match(/\b(\d{7,8})\b/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function preprocesar(img, scale, contrast) {
+  const canvas = createCanvas(img.width * scale, img.height * scale);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, img.width * scale, img.height * scale);
+  const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const px = d.data;
+  for (let i = 0; i < px.length; i += 4) {
+    let g = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+    g = (g - 128) * contrast + 128;
+    g = Math.max(0, Math.min(255, g));
+    px[i] = px[i + 1] = px[i + 2] = g;
+  }
+  ctx.putImageData(d, 0, 0);
+  return canvas.toBuffer('image/png');
+}
+
+function ocrPng(pngBuffer, psm) {
+  const tmp = path.join(os.tmpdir(), 'ocr_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.png');
+  fs.writeFileSync(tmp, pngBuffer);
+  try {
+    return execFileSync('tesseract', [tmp, 'stdout', '--psm', String(psm)], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+  } catch { return ''; }
+  finally { try { fs.unlinkSync(tmp); } catch {} }
+}
+
+function extraerCandidatos(texto) {
+  const cands = [];
+  const re = /(\d{1,2}[.\s]?\d{3}[.\s]?\d{3})/g;
+  let m;
+  while ((m = re.exec(texto)) !== null) {
+    const limpio = m[1].replace(/[.\s]/g, '');
+    if (limpio.length >= 7 && limpio.length <= 8) cands.push(limpio);
+  }
+  return cands;
+}
+
+async function leerOcr(buffer) {
+  const img = await loadImage(buffer);
+  const configs = [{ scale: 3, contrast: 1.4 }, { scale: 3, contrast: 2.0 }, { scale: 4, contrast: 1.6 }];
+  const psms = [3, 11, 12];
+  const votos = {};
+  for (const cfg of configs) {
+    const png = preprocesar(img, cfg.scale, cfg.contrast);
+    for (const psm of psms) {
+      for (const c of extraerCandidatos(ocrPng(png, psm))) votos[c] = (votos[c] || 0) + 1;
+    }
+  }
+  const entradas = Object.entries(votos).sort((a, b) => b[1] - a[1]);
+  if (entradas.length === 0) return { dni: null, confianza: 0 };
+  const [ganador, v] = entradas[0];
+  return { dni: ganador, confianza: Math.round(100 * v / (configs.length * psms.length)) };
+}
+
+async function leerDni({ front, back }) {
+  for (const buf of [front, back].filter(Boolean)) {
+    try { const dni = await leerBarcode(buf); if (dni) return { dni, metodo: 'barcode', confianza: 100 }; } catch {}
+  }
+  for (const buf of [front, back].filter(Boolean)) {
+    try { const r = await leerOcr(buf); if (r.dni && r.confianza >= 50) return { dni: r.dni, metodo: 'ocr', confianza: r.confianza }; } catch {}
+  }
+  return { dni: null, error: 'no_legible' };
+}
+
 // --------- /health ---------
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'pdf-service' }));
+
+// --------- /leer-dni ---------
+// Recibe multipart con "front" y opcionalmente "back". Devuelve { dni, metodo, confianza }
+// o { error: 'no_legible' }.
+const camposDni = upload.fields([
+  { name: 'front', maxCount: 1 },
+  { name: 'back', maxCount: 1 },
+]);
+app.post('/leer-dni', camposDni, async (req, res) => {
+  try {
+    const f = req.files || {};
+    const front = f.front && f.front[0] ? f.front[0].buffer : null;
+    const back = f.back && f.back[0] ? f.back[0].buffer : null;
+    if (!front && !back) return res.status(400).json({ error: 'Falta al menos "front" o "back"' });
+    const r = await leerDni({ front, back });
+    if (r.dni) return res.json(r);
+    return res.status(422).json({ error: 'no_legible' });
+  } catch (e) {
+    res.status(500).json({ error: 'READ_FAIL', detail: String(e.message || e) });
+  }
+});
 
 // --------- /extraer ---------
 app.post('/extraer', upload.single('sds'), async (req, res) => {
