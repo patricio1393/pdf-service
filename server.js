@@ -145,7 +145,8 @@ function ocrPng(pngBuffer, psm) {
   const tmp = path.join(os.tmpdir(), 'ocr_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.png');
   fs.writeFileSync(tmp, pngBuffer);
   try {
-    return execFileSync('tesseract', [tmp, 'stdout', '--psm', String(psm)], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+    // -l eng: el inglés lee mejor los dígitos. Forzado para no depender del idioma por defecto del contenedor.
+    return execFileSync('tesseract', [tmp, 'stdout', '-l', 'eng', '--psm', String(psm)], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
   } catch { return ''; }
   finally { try { fs.unlinkSync(tmp); } catch {} }
 }

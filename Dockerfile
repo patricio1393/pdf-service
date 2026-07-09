@@ -1,7 +1,7 @@
 FROM node:20-alpine
 
-# Instalar Tesseract OCR (con idioma español) para la lectura de DNI
-RUN apk add --no-cache tesseract-ocr tesseract-ocr-data-spa
+# Instalar Tesseract OCR (con idioma inglés para leer dígitos) para la lectura de DNI
+RUN apk add --no-cache tesseract-ocr tesseract-ocr-data-eng
 
 WORKDIR /app
 
