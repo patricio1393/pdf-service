@@ -11,7 +11,7 @@
 const express = require('express');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
-const { PDFDocument } = require('pdf-lib');
+const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 const { createCanvas, loadImage } = require('@napi-rs/canvas');
 const { readBarcodes, setZXingModuleOverrides } = require('zxing-wasm/reader');
 const { execFileSync } = require('child_process');
@@ -271,6 +271,22 @@ app.post('/ensamblar', campos, async (req, res) => {
     for (const s of stamps) {
       const p = pages[s.page === 'last' ? pages.length - 1 : s.page];
       if (p) p.drawImage(firmaPng, { x: s.x, y: s.y, width: s.w, height: s.w * ratio });
+    }
+
+    // 1b) SDS: completar "Aclaración de la Firma/Sello" con el nombre del cliente.
+    // La etiqueta va de x=413 a x=502 en la última página; el nombre se centra
+    // sobre ella, pero nunca antes de x=425 para no invadir la firma.
+    if (tipo === 'SDS' && cliente) {
+      const p = pages[pages.length - 1];
+      if (p) {
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const size = 7;
+        const texto = String(cliente).trim().slice(0, 60);
+        const w = font.widthOfTextAtSize(texto, size);
+        let x = (413 + 502) / 2 - w / 2;
+        if (x < 425) x = 425;
+        p.drawText(texto, { x, y: 560, size, font, color: rgb(0.07, 0.06, 0.08) });
+      }
     }
 
     // 2) hoja de DNI (solo imágenes, sin texto)
