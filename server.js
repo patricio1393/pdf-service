@@ -3,7 +3,7 @@
  *
  * Endpoints (solo accesibles desde la red interna de Docker):
  *   GET  /health      -> chequeo de vida
- *   POST /extraer     -> recibe el PDF (campo "sds"), devuelve { tipo, dni, cliente }
+ *   POST /extraer     -> recibe el PDF (campo "sds"), devuelve { tipo, dni, cliente, numero }
  *   POST /ensamblar   -> recibe sds + firma + front + back, devuelve el PDF final
  *
  * No expone puertos al exterior: n8n le habla por http://pdf-service:3000
@@ -89,7 +89,24 @@ function extraerCliente(text) {
   return null;
 }
 
-// --------- Coordenadas de firma (calibradas con PDFs reales) ---------
+/**
+ * Número de solicitud. SDS: "(34311269SEC)" (8 dígitos + SEC entre paréntesis, arriba a la derecha).
+ * SPN: "Número de Solicitud PNM: 11410593PNA" (8 dígitos + PNA; también va en el código de barras).
+ * Calibrado con las muestras del 16/10/2026.
+ */
+function extraerNumero(text, tipo) {
+  if (tipo === 'SDS') {
+    const m = text.match(/\(\s*(\d{6,10}\s*SEC)\s*\)/i) || text.match(/\b(\d{6,10}SEC)\b/i);
+    return m ? m[1].replace(/\s+/g, '').toUpperCase() : null;
+  }
+  if (tipo === 'SPN') {
+    const m = text.match(/Solicitud\s+PNM\s*:?\s*(\d{6,10}\s*PNA)/i) || text.match(/\b(\d{6,10}PNA)\b/i);
+    return m ? m[1].replace(/\s+/g, '').toUpperCase() : null;
+  }
+  return null;
+}
+
+// --------- Coordenadas de firma (calibradas con PDFs reales; verificadas con las muestras del 16/10/2026) ---------
 const SIG = {
   SDS: [{ page: 'last', x: 270, y: 548, w: 150 }],
   SPN: [
@@ -222,9 +239,10 @@ app.post('/extraer', upload.single('sds'), async (req, res) => {
     const tipo = detectarTipo(text);
     const dni = extraerDni(text);
     const cliente = extraerCliente(text);
+    const numero = extraerNumero(text, tipo);
     if (!tipo) return res.status(422).json({ error: 'TIPO_DESCONOCIDO' });
     if (!dni)  return res.status(422).json({ error: 'NO_DNI' });
-    res.json({ tipo, dni, cliente });
+    res.json({ tipo, dni, cliente, numero });
   } catch (e) {
     res.status(500).json({ error: 'EXTRACT_FAIL', detail: String(e.message || e) });
   }
@@ -309,6 +327,8 @@ app.post('/ensamblar', campos, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${tipo}_firmada_${dni || 'cliente'}.pdf"`);
     res.setHeader('x-dni', dni);
     res.setHeader('x-tipo', tipo);
+    const numero = extraerNumero((await pdfParse(docBuf)).text || '', tipo);
+    if (numero) res.setHeader('x-numero', numero);
     if (cliente) res.setHeader('x-cliente', encodeURIComponent(cliente));
     res.send(Buffer.from(bytes));
   } catch (e) {
