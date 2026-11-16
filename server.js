@@ -4,7 +4,8 @@
  * Endpoints (solo accesibles desde la red interna de Docker):
  *   GET  /health      -> chequeo de vida
  *   POST /extraer     -> recibe el PDF (campo "sds"), devuelve { tipo, dni, cliente, numero }
- *   POST /ensamblar   -> recibe sds + firma + front + back, devuelve el PDF final
+ *   POST /ensamblar   -> recibe sds + firma (+ front + back opcionales), devuelve el PDF firmado
+ *   POST /dni         -> recibe front + back, devuelve un PDF con las fotos del DNI
  *
  * No expone puertos al exterior: n8n le habla por http://pdf-service:3000
  */
@@ -248,6 +249,48 @@ app.post('/extraer', upload.single('sds'), async (req, res) => {
   }
 });
 
+// --------- hoja de DNI (frente arriba, dorso abajo; solo imágenes, sin texto) ---------
+async function embedFoto(pdfDoc, buf) {
+  // las fotos de la plataforma son JPEG; se acepta PNG por si llega una carga manual
+  const esPng = buf.length > 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+  // copia a un Uint8Array propio: pdf-lib lee desde el inicio del ArrayBuffer y un Buffer chico de Node puede venir del pool compartido
+  const bytes = new Uint8Array(buf);
+  return esPng ? pdfDoc.embedPng(bytes) : pdfDoc.embedJpg(bytes);
+}
+async function agregarHojaDni(pdfDoc, frontBuf, backBuf) {
+  const frontImg = await embedFoto(pdfDoc, frontBuf);
+  const backImg  = await embedFoto(pdfDoc, backBuf);
+  const A4W = 595, A4H = 842;
+  const dniPage = pdfDoc.addPage([A4W, A4H]);
+  const margin = 40, gap = 24;
+  const usableW = A4W - margin * 2;
+  const slotH = (A4H - margin * 2 - gap) / 2;
+  const fit = (iw, ih, bw, bh) => { const s = Math.min(bw / iw, bh / ih); return { w: iw * s, h: ih * s }; };
+  const fr = fit(frontImg.width, frontImg.height, usableW, slotH);
+  dniPage.drawImage(frontImg, { x: margin + (usableW - fr.w) / 2, y: A4H - margin - fr.h, width: fr.w, height: fr.h });
+  const bk = fit(backImg.width, backImg.height, usableW, slotH);
+  dniPage.drawImage(backImg, { x: margin + (usableW - bk.w) / 2, y: margin + (slotH - bk.h) / 2, width: bk.w, height: bk.h });
+}
+
+// --------- /dni ---------
+// Recibe multipart con "front" y "back". Devuelve un PDF de una hoja con las dos fotos del DNI.
+app.post('/dni', camposDni, async (req, res) => {
+  try {
+    const f = req.files || {};
+    for (const k of ['front', 'back']) {
+      if (!f[k] || !f[k][0]) return res.status(400).json({ error: 'Falta el archivo "' + k + '"' });
+    }
+    const pdfDoc = await PDFDocument.create();
+    await agregarHojaDni(pdfDoc, f.front[0].buffer, f.back[0].buffer);
+    const bytes = await pdfDoc.save();
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="DNI.pdf"');
+    res.send(Buffer.from(bytes));
+  } catch (e) {
+    res.status(500).json({ error: 'DNI_FAIL', detail: String(e.message || e) });
+  }
+});
+
 // --------- /ensamblar ---------
 const campos = upload.fields([
   { name: 'sds', maxCount: 1 },
@@ -259,13 +302,14 @@ const campos = upload.fields([
 app.post('/ensamblar', campos, async (req, res) => {
   try {
     const f = req.files || {};
-    for (const k of ['sds', 'firma', 'front', 'back']) {
+    for (const k of ['sds', 'firma']) {
       if (!f[k] || !f[k][0]) return res.status(400).json({ error: 'Falta el archivo "' + k + '"' });
     }
     const docBuf   = f.sds[0].buffer;
     const firmaBuf = f.firma[0].buffer;
-    const frontBuf = f.front[0].buffer;
-    const backBuf  = f.back[0].buffer;
+    // front/back son opcionales: si vienen los dos, se agrega la hoja con el DNI al final
+    const frontBuf = f.front && f.front[0] ? f.front[0].buffer : null;
+    const backBuf  = f.back && f.back[0] ? f.back[0].buffer : null;
 
     // tipo/dni/cliente: los manda n8n como campos, o los recalculamos
     let tipo = (req.body.tipo || '').toUpperCase();
@@ -307,20 +351,9 @@ app.post('/ensamblar', campos, async (req, res) => {
       }
     }
 
-    // 2) hoja de DNI (solo imágenes, sin texto)
-    const frontImg = await pdfDoc.embedJpg(frontBuf);
-    const backImg  = await pdfDoc.embedJpg(backBuf);
-    const A4W = 595, A4H = 842;
-    const dniPage = pdfDoc.addPage([A4W, A4H]);
-
-    const margin = 40, gap = 24;
-    const usableW = A4W - margin * 2;
-    const slotH = (A4H - margin * 2 - gap) / 2;
-    const fit = (iw, ih, bw, bh) => { const s = Math.min(bw / iw, bh / ih); return { w: iw * s, h: ih * s }; };
-    const fr = fit(frontImg.width, frontImg.height, usableW, slotH);
-    dniPage.drawImage(frontImg, { x: margin + (usableW - fr.w) / 2, y: A4H - margin - fr.h, width: fr.w, height: fr.h });
-    const bk = fit(backImg.width, backImg.height, usableW, slotH);
-    dniPage.drawImage(backImg, { x: margin + (usableW - bk.w) / 2, y: margin + (slotH - bk.h) / 2, width: bk.w, height: bk.h });
+    // 2) hoja de DNI: solo si llegan las fotos (compatibilidad con el flujo anterior).
+    // Desde nov/2026 la plataforma no las manda: el DNI va en un PDF aparte (POST /dni).
+    if (frontBuf && backBuf) await agregarHojaDni(pdfDoc, frontBuf, backBuf);
 
     const bytes = await pdfDoc.save();
     res.setHeader('Content-Type', 'application/pdf');
